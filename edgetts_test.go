@@ -259,6 +259,54 @@ func TestReportsTheVoiceThatCannotReadTheText(t *testing.T) {
 	}
 }
 
+func TestRejectsAnEmptyTextWithoutConnecting(t *testing.T) {
+	svc, tts := startService(t, &fakeService{})
+	for _, text := range []string{"", "  \n\t "} {
+		if err := tts.Synthesize(context.Background(), text, "en-US-AriaNeural"); !errors.Is(err, ErrEmptyText) {
+			t.Fatalf("err = %v", err)
+		}
+	}
+	if len(svc.connections) != 0 {
+		t.Fatal("connected for an empty text")
+	}
+}
+
+func TestReportsTheReasonTheServiceGivesForRefusing(t *testing.T) {
+	_, tts := startService(t, &fakeService{closeCode: 1007, closeReason: "Unsupported voice xx-XX-NobodyNeural."})
+	err := tts.Synthesize(context.Background(), "hi", "xx-XX-NobodyNeural")
+	var refused *RefusedError
+	if !errors.As(err, &refused) || refused.Code != 1007 {
+		t.Fatalf("err = %v", err)
+	}
+	if want := "edge-tts: the service refused the request: Unsupported voice xx-XX-NobodyNeural."; err.Error() != want {
+		t.Fatalf("message = %q, want %q", err.Error(), want)
+	}
+}
+
+func TestTreatsANormalCloseAsTheEnd(t *testing.T) {
+	var frames []frame
+	for _, f := range loadSession(t).Frames {
+		if f.Text == nil || !strings.Contains(*f.Text, "Path:turn.end") {
+			frames = append(frames, f)
+		}
+	}
+	_, tts := startService(t, &fakeService{frames: frames, endWithClose: true})
+	if err := tts.Synthesize(context.Background(), "hi", "en-US-AriaNeural"); err != nil {
+		t.Fatal(err)
+	}
+	if audio, _ := tts.Bytes(); len(audio) != 736 {
+		t.Fatalf("kept %d bytes", len(audio))
+	}
+}
+
+func TestReportsAConnectionThatDrops(t *testing.T) {
+	_, tts := startService(t, &fakeService{drop: true})
+	err := tts.Synthesize(context.Background(), "hi", "en-US-AriaNeural")
+	if err == nil || err.Error() != "edge-tts: the service closed the connection" {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestTimesOutWhenTheServiceIsSilent(t *testing.T) {
 	_, tts := startService(t, &fakeService{silent: true})
 	tts.idleTimeout = 100 * time.Millisecond

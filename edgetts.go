@@ -36,8 +36,14 @@ var (
 	// ErrEmptyAudio is returned when the service answers without audio. It
 	// does that when the voice cannot read the text: voices are locale
 	// specific, so an English voice cannot read Chinese or Cyrillic text.
+	// It does the same for a text of only punctuation.
 	ErrEmptyAudio = errors.New("edge-tts: the service returned no audio; " +
-		"voices are locale specific, check that the voice matches the language of the text")
+		"voices are locale specific, check that the voice matches the language of the text " +
+		"and that the text has words to read")
+
+	// ErrEmptyText is returned, without connecting, for a text that is
+	// empty or only whitespace.
+	ErrEmptyText = errors.New("edge-tts: the text is empty")
 
 	// ErrNoMetadata is returned by SaveMetadata when there are no word boundaries.
 	ErrNoMetadata = errors.New("edge-tts: no metadata available to save")
@@ -50,6 +56,22 @@ type HandshakeError struct {
 
 func (e *HandshakeError) Error() string {
 	return fmt.Sprintf("edge-tts: the service refused the connection (HTTP %d)", e.StatusCode)
+}
+
+// RefusedError is returned when the service closes the connection with a
+// reason, as it does for an unsupported voice or output format.
+type RefusedError struct {
+	// Code is the WebSocket close code, such as 1007.
+	Code int
+	// Reason is what the service said, such as "Unsupported voice xx-XX-NobodyNeural."
+	Reason string
+}
+
+func (e *RefusedError) Error() string {
+	if e.Reason == "" {
+		return fmt.Sprintf("edge-tts: the service refused the request (close code %d)", e.Code)
+	}
+	return "edge-tts: the service refused the request: " + e.Reason
 }
 
 // WordBoundary tells when a word is spoken. Offset and Duration are in
@@ -156,6 +178,9 @@ func (t *EdgeTTS) Stream(ctx context.Context, text, voice string, opts ...Option
 }
 
 func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, onAudio func([]byte) bool) error {
+	if strings.TrimSpace(text) == "" {
+		return ErrEmptyText
+	}
 	s := settings{format: Audio24khz48kbitrateMonoMP3}
 	for _, opt := range opts {
 		opt(&s)
@@ -199,8 +224,16 @@ func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, on
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(t.idleTimeout))
 		kind, data, err := conn.ReadMessage()
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-			return t.finish()
+		var closeErr *websocket.CloseError
+		if errors.As(err, &closeErr) && ctx.Err() == nil {
+			switch closeErr.Code {
+			case websocket.CloseNormalClosure:
+				return t.finish()
+			case websocket.CloseAbnormalClosure:
+				// The connection dropped without a close frame.
+				return errors.New("edge-tts: the service closed the connection")
+			}
+			return &RefusedError{Code: closeErr.Code, Reason: closeErr.Text}
 		}
 		if err != nil {
 			return t.readError(ctx, err)

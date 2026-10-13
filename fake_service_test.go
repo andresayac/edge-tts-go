@@ -73,7 +73,15 @@ type fakeService struct {
 	// Frames to replay after the SSML message.
 	frames []frame
 	// Does not answer the SSML message at all.
-	silent      bool
+	silent bool
+	// Closes the connection with this code and reason after the SSML
+	// message, as the service does for an unsupported voice.
+	closeCode   int
+	closeReason string
+	// Closes the connection normally after replaying the frames.
+	endWithClose bool
+	// Drops the TCP connection after the SSML message, without a close frame.
+	drop        bool
 	voiceStatus int
 	voiceBody   string
 
@@ -139,6 +147,14 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(msg, "Path:ssml") || f.silent {
 				continue
 			}
+			if f.drop {
+				ws.UnderlyingConn().Close()
+				return
+			}
+			if f.closeCode != 0 {
+				ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(f.closeCode, f.closeReason))
+				continue
+			}
 			for _, fr := range f.frames {
 				if fr.Text != nil {
 					ws.WriteMessage(websocket.TextMessage, []byte(*fr.Text))
@@ -146,6 +162,9 @@ func (f *fakeService) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				b, _ := base64.StdEncoding.DecodeString(fr.Binary)
 				ws.WriteMessage(websocket.BinaryMessage, b)
+			}
+			if f.endWithClose {
+				ws.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 			}
 		}
 	default:

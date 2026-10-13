@@ -121,6 +121,8 @@ Every option is optional. A bare number works too: `WithRate("50")` is `+50%` an
 | `Audio24khz96kbitrateMonoMP3` | `audio-24khz-96kbitrate-mono-mp3` | `.mp3` |
 | `Webm24khz16bitMonoOpus` | `webm-24khz-16bit-mono-opus` | `.webm` |
 
+These are the only formats the service accepts. It refuses the other Azure formats (WAV, PCM, OGG, 48 kHz MP3...) with "Unsupported Edge output format".
+
 #### Matching the voice to the text
 
 Voices are locale specific. A voice can only read text written in the script of its own language, so passing Chinese, Cyrillic, Arabic or Devanagari text to an English voice returns no audio. `Synthesize` then returns `edgetts.ErrEmptyAudio`:
@@ -179,10 +181,12 @@ err := tts.SaveMetadata("words.json")
 
 | Error | When |
 | --- | --- |
+| `ErrEmptyText` | An empty text; nothing is sent |
 | `ErrNoAudio` | Asking for audio before a synthesis |
 | `ErrEmptyAudio` | The voice cannot read the text |
 | `ErrNoMetadata` | `SaveMetadata` without word boundaries |
 | `*HandshakeError` | The service refused the connection; holds the HTTP status |
+| `*RefusedError` | The service refused the request, such as "Unsupported voice xx-XX-NobodyNeural."; holds the close code and the reason |
 
 A machine whose clock is off by more than a few minutes is refused by the service. The client then corrects its clock from the response and tries once more.
 
