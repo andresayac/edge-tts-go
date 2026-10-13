@@ -1,0 +1,14 @@
+# Binaries
+*.exe
+/edge-tts
+/dist/
+
+# Generated audio
+*.mp3
+*.webm
+*.ogg
+*.wav
+
+# Editors
+.idea/
+.vscode/
