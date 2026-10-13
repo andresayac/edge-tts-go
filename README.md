@@ -4,7 +4,15 @@
 
 **edge-tts-go** turns text into natural-sounding speech with the online text-to-speech service of Microsoft Edge, without Edge, Windows or an API key.
 
-It is the Go port of [`@andresaya/edge-tts`](https://github.com/andresayac/edge-tts) for Node.js. A PHP version lives in [`edge-tts-php`](https://github.com/andresayac/edge-tts-php).
+## Available in three languages
+
+The same library for the Edge text-to-speech service, in Node.js, PHP and Go:
+
+| Language | Install | Repository |
+| --- | --- | --- |
+| Node.js and browsers | `npm install @andresaya/edge-tts` | [andresayac/edge-tts](https://github.com/andresayac/edge-tts) |
+| PHP | `composer require afaya/edge-tts` | [andresayac/edge-tts-php](https://github.com/andresayac/edge-tts-php) |
+| **Go** (this one) | `go get github.com/andresayac/edge-tts-go` | [andresayac/edge-tts-go](https://github.com/andresayac/edge-tts-go) |
 
 ## Features
 
