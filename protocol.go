@@ -150,7 +150,7 @@ func speechConfigMessage(format string) string {
 	return "X-Timestamp:" + timestamp() + "\r\n" +
 		"Content-Type:application/json; charset=utf-8\r\n" +
 		"Path:speech.config\r\n\r\n" +
-		`{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":false,"wordBoundaryEnabled":true},"outputFormat":` +
+		`{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":true,"wordBoundaryEnabled":true},"outputFormat":` +
 		string(quoted) + `}}}}`
 }
 
@@ -202,16 +202,18 @@ type metadataMessage struct {
 	} `json:"Metadata"`
 }
 
-func parseWordBoundaries(body []byte) []WordBoundary {
+// parseBoundaries returns the word and sentence boundaries of an
+// audio.metadata message.
+func parseBoundaries(body []byte) []Boundary {
 	var msg metadataMessage
 	if json.Unmarshal(body, &msg) != nil {
 		return nil
 	}
-	var out []WordBoundary
+	var out []Boundary
 	for _, m := range msg.Metadata {
-		if m.Type == "WordBoundary" {
-			out = append(out, WordBoundary{
-				Type:     "WordBoundary",
+		if m.Type == "WordBoundary" || m.Type == "SentenceBoundary" {
+			out = append(out, Boundary{
+				Type:     m.Type,
 				Offset:   m.Data.Offset,
 				Duration: m.Data.Duration,
 				Text:     m.Data.Text.Text,
@@ -219,4 +221,90 @@ func parseWordBoundaries(body []byte) []WordBoundary {
 		}
 	}
 	return out
+}
+
+// Punctuation that opens a sentence and that the service leaves out of the
+// text of its sentence boundaries.
+var openingPunctuation = []string{"¿", "¡", "«", `"`, "'", "“", "‘", "(", "["}
+
+// sentenceTextRestorer returns a function that puts back the opening
+// punctuation the service drops from sentence boundaries, such as the ¿ of
+// "¿Cómo estás?". It takes the sentences in order and finds each one in
+// source.
+func sentenceTextRestorer(source string) func(string) string {
+	cursor := 0
+	return func(text string) string {
+		if text == "" {
+			return text
+		}
+		i := strings.Index(source[cursor:], text)
+		if i < 0 {
+			return text
+		}
+		index := cursor + i
+		start := index
+		for moved := true; moved; {
+			moved = false
+			for _, mark := range openingPunctuation {
+				if start-len(mark) >= cursor && strings.HasSuffix(source[:start], mark) {
+					start -= len(mark)
+					moved = true
+				}
+			}
+		}
+		cursor = index + len(text)
+		return source[start:cursor]
+	}
+}
+
+// filePath returns path plus "."+ext, unless path already ends with it.
+func filePath(path, ext string) string {
+	suffix := "." + ext
+	if len(path) >= len(suffix) && strings.EqualFold(path[len(path)-len(suffix):], suffix) {
+		return path
+	}
+	return path + suffix
+}
+
+// extension returns the file extension of an output format, such as "mp3".
+func extension(format string) string {
+	has := func(s string) bool { return strings.Contains(format, s) }
+	switch {
+	case has("mp3"):
+		return "mp3"
+	case has("opus") && has("webm"):
+		return "webm"
+	case has("opus") && has("ogg"):
+		return "ogg"
+	case has("wav") || has("riff"):
+		return "wav"
+	case has("pcm") && has("raw"):
+		return "pcm"
+	case has("alaw"):
+		return "alaw"
+	case has("mulaw"):
+		return "mulaw"
+	case has("truesilk"):
+		return "silk"
+	case has("g722"):
+		return "g722"
+	case has("amr"):
+		return "amr"
+	}
+	return "audio"
+}
+
+var kbitratePattern = regexp.MustCompile(`(\d+)kbitrate`)
+
+// estimateDuration estimates the length of size bytes of audio from the
+// bitrate of the format. MP3 is constant bitrate; formats without one
+// (opus) assume 48 kbit/s.
+func estimateDuration(size int, format string) time.Duration {
+	kbps := int64(48)
+	if m := kbitratePattern.FindStringSubmatch(format); m != nil {
+		if v, _ := strconv.ParseInt(m[1], 10, 64); v > 0 {
+			kbps = v
+		}
+	}
+	return time.Duration(int64(size) * 8 * int64(time.Millisecond) / kbps)
 }

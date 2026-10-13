@@ -39,6 +39,14 @@ func baseHeaders() http.Header {
 	return h
 }
 
+// withHeaders returns base with the headers of extra added or replaced.
+func withHeaders(base, extra http.Header) http.Header {
+	for name, values := range extra {
+		base[name] = values
+	}
+	return base
+}
+
 func wssHeaders() http.Header {
 	h := baseHeaders()
 	h.Set("Pragma", "no-cache")

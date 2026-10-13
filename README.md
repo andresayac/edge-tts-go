@@ -18,10 +18,13 @@ The same library for the Edge text-to-speech service, in Node.js, PHP and Go:
 
 - **Text-to-speech** with more than 300 neural voices in over 100 locales.
 - **Streaming**: get the audio as it arrives with a `range` loop.
-- **Word boundaries**: know when each word is spoken.
-- **Voice filtering** by language and gender.
+- **Word and sentence boundaries**: know when each word and sentence is spoken.
+- **Subtitles**: SRT or WebVTT, one cue per sentence.
+- **Voice filtering** by language and gender, with the list cached for 10 minutes.
 - **Pitch, rate and volume** control.
+- **Configurable**: override the endpoint, headers and timeout without waiting for a release.
 - **Context support**: cancel or time out any request.
+- **Concurrent**: `Generate` and `Voices` are safe from many goroutines.
 - **Command-line tool** included.
 - One dependency ([gorilla/websocket](https://github.com/gorilla/websocket)).
 
@@ -72,24 +75,47 @@ go install github.com/andresayac/edge-tts-go/cmd/edge-tts@latest
 # Synthesize text to hello.mp3
 edge-tts synthesize -t "Hello, world!" -o hello
 
-# Read the text from a file, with another voice and prosody
-edge-tts synthesize -f story.txt -v es-CO-SalomeNeural -r +10% -p -5Hz -o story
+# Read the text from a file, with another voice and prosody, and write subtitles too
+edge-tts synthesize -f story.txt -v es-CO-SalomeNeural -r +10% -p -5Hz -o story --subtitles story.srt
 
-# List the voices
+# Read from stdin, WebM/Opus output, WebVTT subtitles
+cat story.txt | edge-tts synthesize -f - --format webm-24khz-16bit-mono-opus -o story --subtitles story.vtt
+
+# List the voices, optionally filtered
 edge-tts voice-list
+edge-tts voice-list --locale es-CO --gender female
 ```
 
 | Option | Description | Default |
 | --- | --- | --- |
 | `-t, --text` | Text to convert to audio | |
-| `-f, --file` | Input file (text) | |
+| `-f, --file` | Input file (text), or `-` for stdin | |
 | `-v, --voice` | Voice to use | `en-US-AriaNeural` |
 | `-r, --rate` | Rate of speech | `0%` |
 | `-l, --volume` | Volume of speech | `0%` |
 | `-p, --pitch` | Pitch of speech | `0Hz` |
-| `-o, --output` | Output file name, without extension | `output_<timestamp>` |
+| `-o, --output` | Output file name; the extension is added when missing | `output_<timestamp>` |
+| `--format` | Output format | `audio-24khz-48kbitrate-mono-mp3` |
+| `--subtitles` | Write subtitles: `.srt`, or `.vtt` for WebVTT | |
 
 ## API
+
+### Configuration
+
+Every option is optional. The defaults come from the constants of the package, so when Microsoft changes the service you can set the new values yourself instead of waiting for a release.
+
+```go
+tts := edgetts.New(
+	edgetts.WithWSSURL("wss://api.msedgeservices.com/tts/cognitiveservices/websocket/v1"),
+	edgetts.WithVoicesURL("https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/voices/list"),
+	edgetts.WithSecMSGECVersion("1-155.0.4283.45"),
+	edgetts.WithHeader("User-Agent", "..."), // added to the default headers, or replacing one
+	edgetts.WithTimeout(30*time.Second),     // without data from the service
+	edgetts.WithVoicesCacheTTL(10*time.Minute), // 0 fetches the voice list every time
+)
+```
+
+A `context` bounds a whole call; `WithTimeout` only how long the service may stay silent.
 
 ### Voices
 
@@ -157,6 +183,24 @@ for chunk, err := range tts.Stream(ctx, "Long text to stream...", "en-US-AriaNeu
 
 Breaking out of the loop closes the connection.
 
+### Everything in one result
+
+`Generate` returns the audio, the boundaries and the duration in a `Result`, and leaves the `EdgeTTS` as it was, so many goroutines can share one client:
+
+```go
+r, err := tts.Generate(ctx, "¿Cómo estás? ¡Qué bien!", "es-CO-SalomeNeural")
+
+r.Audio              // []byte
+r.Format             // "mp3"
+r.OutputFormat       // "audio-24khz-48kbitrate-mono-mp3"
+r.WordBoundaries
+r.SentenceBoundaries
+r.Duration           // estimated
+
+path, err := r.ToFile("greeting") // greeting.mp3
+srt := r.SRT()                    // or r.VTT()
+```
+
 ### Getting the audio
 
 After `Synthesize` (or a full `Stream`):
@@ -165,12 +209,13 @@ After `Synthesize` (or a full `Stream`):
 audio, err := tts.Bytes()            // []byte
 encoded, err := tts.Base64()         // string
 path, err := tts.ToFile("out/audio") // out/audio.mp3
+path, err = tts.ToFile("out/audio.mp3") // out/audio.mp3, the extension is not repeated
 info, err := tts.AudioInfo()         // {Size: 46944, Format: "mp3", EstimatedDuration: 3.912s}
 d, err := tts.Duration()             // estimated from the size and bitrate
 ext := tts.Extension()               // "mp3"
 ```
 
-### Word boundaries
+### Word and sentence boundaries
 
 ```go
 for _, w := range tts.WordBoundaries() {
@@ -180,10 +225,32 @@ for _, w := range tts.WordBoundaries() {
 // 613.625ms  cómo
 // ...
 
+tts.SentenceBoundaries() // the same, one per sentence
 err := tts.SaveMetadata("words.json")
 ```
 
 `Offset` and `Duration` are in 100-nanosecond units, as the service sends them; `Start()` and `End()` return them as `time.Duration`.
+
+The service leaves the opening punctuation out of its sentences, so "¿Cómo estás?" comes back as "Cómo estás?". The library puts it back from your text: ¿ ¡ « " ' “ ‘ ( [.
+
+### Subtitles
+
+```go
+os.WriteFile("speech.srt", []byte(tts.SRT()), 0o644) // one cue per sentence
+os.WriteFile("speech.vtt", []byte(tts.VTT()), 0o644)
+
+edgetts.SRT(tts.WordBoundaries()) // one cue per word
+```
+
+```
+1
+00:00:00,050 --> 00:00:01,600
+¿Cómo estás?
+
+2
+00:00:01,600 --> 00:00:02,950
+¡Qué bien!
+```
 
 ### Errors
 
@@ -200,12 +267,13 @@ A machine whose clock is off by more than a few minutes is refused by the servic
 
 ### Concurrency
 
-An `EdgeTTS` keeps the audio of its last synthesis, so it is not safe for concurrent use. Create one per goroutine; they are cheap.
+`Synthesize` and `Stream` keep the audio of the last synthesis in the `EdgeTTS`, so they are not safe for concurrent use. `Generate` and `Voices` are: share one client and call `Generate` from as many goroutines as you need.
 
 ## Examples
 
 - [`examples/basic`](examples/basic): synthesize to a file and list voices.
 - [`examples/stream`](examples/stream): stream the audio to a file.
+- [`examples/subtitles`](examples/subtitles): generate the audio and its subtitles in one call.
 
 ```bash
 go run ./examples/basic

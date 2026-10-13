@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	edgetts "github.com/andresayac/edge-tts-go"
 )
@@ -66,6 +67,19 @@ func ExampleEdgeTTS_VoicesByLanguage() {
 	for _, v := range voices {
 		fmt.Println(v.ShortName, v.Gender) // es-CO-GonzaloNeural Male ...
 	}
+}
+
+func ExampleEdgeTTS_Generate() {
+	// One client, many goroutines: Generate keeps nothing in the EdgeTTS.
+	tts := edgetts.New(edgetts.WithTimeout(20 * time.Second))
+	r, err := tts.Generate(context.Background(), "¿Cómo estás? ¡Qué bien!", "es-CO-SalomeNeural")
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := r.ToFile("greeting"); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Print(r.SRT())
 }
 
 func ExampleEdgeTTS_WordBoundaries() {

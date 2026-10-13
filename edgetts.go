@@ -7,8 +7,10 @@
 //	}
 //	path, err := tts.ToFile("hello") // hello.mp3
 //
-// An EdgeTTS keeps the audio and the word boundaries of its last synthesis,
-// so it is not safe for concurrent use: create one per goroutine.
+// Synthesize and Stream keep the audio and the boundaries of the last
+// synthesis in the EdgeTTS, so they are not safe for concurrent use.
+// Generate returns them in a Result instead and, like Voices, can run from
+// many goroutines at once.
 package edgetts
 
 import (
@@ -21,9 +23,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
-	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -74,20 +75,27 @@ func (e *RefusedError) Error() string {
 	return "edge-tts: the service refused the request: " + e.Reason
 }
 
-// WordBoundary tells when a word is spoken. Offset and Duration are in
-// 100-nanosecond units, as the service sends them.
-type WordBoundary struct {
+// Boundary tells when a word or a sentence is spoken. Offset and Duration
+// are in 100-nanosecond units, as the service sends them.
+type Boundary struct {
+	// Type is "WordBoundary" or "SentenceBoundary".
 	Type     string `json:"type"`
 	Offset   int64  `json:"offset"`
 	Duration int64  `json:"duration"`
 	Text     string `json:"text"`
 }
 
-// Start returns when the word starts, from the beginning of the audio.
-func (w WordBoundary) Start() time.Duration { return time.Duration(w.Offset) * 100 }
+// WordBoundary tells when a word is spoken.
+type WordBoundary = Boundary
 
-// End returns when the word ends, from the beginning of the audio.
-func (w WordBoundary) End() time.Duration { return time.Duration(w.Offset+w.Duration) * 100 }
+// SentenceBoundary tells when a sentence is spoken.
+type SentenceBoundary = Boundary
+
+// Start returns when the word or sentence starts, from the beginning of the audio.
+func (b Boundary) Start() time.Duration { return time.Duration(b.Offset) * 100 }
+
+// End returns when the word or sentence ends, from the beginning of the audio.
+func (b Boundary) End() time.Duration { return time.Duration(b.Offset+b.Duration) * 100 }
 
 // AudioInfo describes the audio of the last synthesis.
 type AudioInfo struct {
@@ -118,39 +126,97 @@ func WithVolume(volume string) Option { return func(s *settings) { s.volume = vo
 // WithOutputFormat sets the audio format, such as Audio24khz96kbitrateMonoMP3.
 func WithOutputFormat(format string) Option { return func(s *settings) { s.format = format } }
 
+// ClientOption configures an EdgeTTS. The defaults come from the constants
+// of the package, so when Microsoft changes the service the new values can
+// be set without waiting for a release.
+type ClientOption func(*EdgeTTS)
+
+// WithWSSURL sets the WebSocket endpoint of the synthesis.
+func WithWSSURL(url string) ClientOption { return func(t *EdgeTTS) { t.wssURL = url } }
+
+// WithVoicesURL sets the URL of the voice list.
+func WithVoicesURL(url string) ClientOption { return func(t *EdgeTTS) { t.voicesURL = url } }
+
+// WithSecMSGECVersion sets the Sec-MS-GEC-Version sent with every request.
+func WithSecMSGECVersion(version string) ClientOption {
+	return func(t *EdgeTTS) { t.secMSGECVersion = version }
+}
+
+// WithHeader adds a header to every request, or replaces a default one
+// such as User-Agent.
+func WithHeader(name, value string) ClientOption {
+	return func(t *EdgeTTS) { t.headers.Set(name, value) }
+}
+
+// WithTimeout sets how long to wait without data from the service before
+// giving up. The default is 30 seconds. A context bounds a whole call.
+func WithTimeout(timeout time.Duration) ClientOption {
+	return func(t *EdgeTTS) {
+		t.idleTimeout = timeout
+		t.httpClient.Timeout = timeout
+		t.dialer.HandshakeTimeout = timeout
+	}
+}
+
+// WithVoicesCacheTTL sets how long Voices reuses the voice list. The
+// default is 10 minutes; 0 fetches it every time.
+func WithVoicesCacheTTL(ttl time.Duration) ClientOption {
+	return func(t *EdgeTTS) { t.voicesCacheTTL = ttl }
+}
+
 // EdgeTTS synthesizes speech and keeps the result of its last synthesis.
 type EdgeTTS struct {
-	audio      []byte
-	format     string
-	boundaries []WordBoundary
+	audio     []byte
+	format    string
+	words     []Boundary
+	sentences []Boundary
 
-	wssURL      string
-	voicesURL   string
-	idleTimeout time.Duration
-	httpClient  *http.Client
-	dialer      *websocket.Dialer
+	wssURL          string
+	voicesURL       string
+	secMSGECVersion string
+	headers         http.Header
+	idleTimeout     time.Duration
+	voicesCacheTTL  time.Duration
+	httpClient      *http.Client
+	dialer          *websocket.Dialer
+
+	voicesMu      sync.Mutex
+	voicesCache   []Voice
+	voicesExpires time.Time
 }
 
 // New returns a client for the Edge text-to-speech service.
-func New() *EdgeTTS {
-	return &EdgeTTS{
-		format:      Audio24khz48kbitrateMonoMP3,
-		wssURL:      WSSURL,
-		voicesURL:   VoicesURL,
-		idleTimeout: 30 * time.Second,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
+func New(opts ...ClientOption) *EdgeTTS {
+	t := &EdgeTTS{
+		format:          Audio24khz48kbitrateMonoMP3,
+		wssURL:          WSSURL,
+		voicesURL:       VoicesURL,
+		secMSGECVersion: SecMSGECVersion,
+		headers:         http.Header{},
+		idleTimeout:     30 * time.Second,
+		voicesCacheTTL:  10 * time.Minute,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		dialer: &websocket.Dialer{
 			Proxy:            http.ProxyFromEnvironment,
 			HandshakeTimeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(t)
+	}
+	return t
 }
 
-// Synthesize speaks text with voice and keeps the audio and word
-// boundaries, which Bytes, ToFile and WordBoundaries then return. An empty
-// voice means DefaultVoice.
+// Synthesize speaks text with voice and keeps the audio and the
+// boundaries, which Bytes, ToFile, WordBoundaries and SRT then return. An
+// empty voice means DefaultVoice.
 func (t *EdgeTTS) Synthesize(ctx context.Context, text, voice string, opts ...Option) error {
-	return t.run(ctx, text, voice, opts, nil)
+	for _, err := range t.Stream(ctx, text, voice, opts...) {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Stream speaks text with voice and yields the audio as it arrives:
@@ -166,20 +232,61 @@ func (t *EdgeTTS) Synthesize(ctx context.Context, text, voice string, opts ...Op
 // as with Synthesize.
 func (t *EdgeTTS) Stream(ctx context.Context, text, voice string, opts ...Option) iter.Seq2[[]byte, error] {
 	return func(yield func([]byte, error) bool) {
+		t.audio, t.words, t.sentences = nil, nil, nil
 		stopped := false
-		err := t.run(ctx, text, voice, opts, func(chunk []byte) bool {
+		format, err := t.session(ctx, text, voice, opts, func(chunk []byte) bool {
+			t.audio = append(t.audio, chunk...)
 			stopped = !yield(chunk, nil)
 			return !stopped
-		})
+		}, collector(text, &t.words, &t.sentences))
+		if format != "" {
+			t.format = format
+		}
 		if err != nil && !stopped {
 			yield(nil, err)
 		}
 	}
 }
 
-func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, onAudio func([]byte) bool) error {
+// Generate speaks text with voice and returns the audio, the boundaries
+// and the duration, without changing what the EdgeTTS keeps. It is safe to
+// call from many goroutines at once.
+func (t *EdgeTTS) Generate(ctx context.Context, text, voice string, opts ...Option) (*Result, error) {
+	r := &Result{}
+	format, err := t.session(ctx, text, voice, opts, func(chunk []byte) bool {
+		r.Audio = append(r.Audio, chunk...)
+		return true
+	}, collector(text, &r.WordBoundaries, &r.SentenceBoundaries))
+	if err != nil {
+		return nil, err
+	}
+	r.OutputFormat = format
+	r.Format = extension(format)
+	r.Duration = estimateDuration(len(r.Audio), format)
+	return r, nil
+}
+
+// collector returns a function that files each boundary in words or
+// sentences, putting back the opening punctuation the service drops from
+// sentences.
+func collector(text string, words, sentences *[]Boundary) func(Boundary) {
+	restore := sentenceTextRestorer(text)
+	return func(b Boundary) {
+		if b.Type == "WordBoundary" {
+			*words = append(*words, b)
+			return
+		}
+		b.Text = restore(b.Text)
+		*sentences = append(*sentences, b)
+	}
+}
+
+// session runs one synthesis. It reads the configuration of t but changes
+// nothing in it, and returns the output format it asked for.
+func (t *EdgeTTS) session(ctx context.Context, text, voice string, opts []Option,
+	onAudio func([]byte) bool, onBoundary func(Boundary)) (string, error) {
 	if strings.TrimSpace(text) == "" {
-		return ErrEmptyText
+		return "", ErrEmptyText
 	}
 	s := settings{format: Audio24khz48kbitrateMonoMP3}
 	for _, opt := range opts {
@@ -187,25 +294,23 @@ func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, on
 	}
 	pitch, err := formatPitch(s.pitch)
 	if err != nil {
-		return err
+		return "", err
 	}
 	rate, err := formatRate(s.rate)
 	if err != nil {
-		return err
+		return "", err
 	}
 	volume, err := formatVolume(s.volume)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if voice == "" {
 		voice = DefaultVoice
 	}
 
-	t.audio, t.boundaries, t.format = nil, nil, s.format
-
 	conn, err := t.connect(ctx)
 	if err != nil {
-		return err
+		return s.format, err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
@@ -217,10 +322,17 @@ func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, on
 	}
 	for _, msg := range messages {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
-			return t.readError(ctx, err)
+			return s.format, t.readError(ctx, err)
 		}
 	}
 
+	received := false
+	finish := func() (string, error) {
+		if !received {
+			return s.format, ErrEmptyAudio
+		}
+		return s.format, nil
+	}
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(t.idleTimeout))
 		kind, data, err := conn.ReadMessage()
@@ -228,15 +340,15 @@ func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, on
 		if errors.As(err, &closeErr) && ctx.Err() == nil {
 			switch closeErr.Code {
 			case websocket.CloseNormalClosure:
-				return t.finish()
+				return finish()
 			case websocket.CloseAbnormalClosure:
 				// The connection dropped without a close frame.
-				return errors.New("edge-tts: the service closed the connection")
+				return s.format, errors.New("edge-tts: the service closed the connection")
 			}
-			return &RefusedError{Code: closeErr.Code, Reason: closeErr.Text}
+			return s.format, &RefusedError{Code: closeErr.Code, Reason: closeErr.Text}
 		}
 		if err != nil {
-			return t.readError(ctx, err)
+			return s.format, t.readError(ctx, err)
 		}
 
 		switch kind {
@@ -244,31 +356,26 @@ func (t *EdgeTTS) run(ctx context.Context, text, voice string, opts []Option, on
 			path, body := parseTextFrame(data)
 			switch path {
 			case "audio.metadata":
-				t.boundaries = append(t.boundaries, parseWordBoundaries(body)...)
+				for _, b := range parseBoundaries(body) {
+					onBoundary(b)
+				}
 			case "turn.end":
-				return t.finish()
+				return finish()
 			}
 		case websocket.BinaryMessage:
 			path, body, err := parseBinaryFrame(data)
 			if err != nil {
-				return err
+				return s.format, err
 			}
 			if path != "audio" || len(body) == 0 {
 				continue
 			}
-			t.audio = append(t.audio, body...)
-			if onAudio != nil && !onAudio(body) {
-				return nil
+			received = true
+			if !onAudio(body) {
+				return s.format, nil
 			}
 		}
 	}
-}
-
-func (t *EdgeTTS) finish() error {
-	if len(t.audio) == 0 {
-		return ErrEmptyAudio
-	}
-	return nil
 }
 
 func (t *EdgeTTS) readError(ctx context.Context, err error) error {
@@ -287,9 +394,9 @@ func (t *EdgeTTS) connect(ctx context.Context) (*websocket.Conn, error) {
 		url := t.wssURL +
 			"?Ocp-Apim-Subscription-Key=" + TrustedClientToken +
 			"&Sec-MS-GEC=" + secMSGEC(now()) +
-			"&Sec-MS-GEC-Version=" + SecMSGECVersion +
+			"&Sec-MS-GEC-Version=" + t.secMSGECVersion +
 			"&ConnectionId=" + randomHex()
-		conn, resp, err := t.dialer.DialContext(ctx, url, wssHeaders())
+		conn, resp, err := t.dialer.DialContext(ctx, url, withHeaders(wssHeaders(), t.headers))
 		if err == nil {
 			return conn, nil
 		}
@@ -324,8 +431,6 @@ func (t *EdgeTTS) Base64() (string, error) {
 	return base64.StdEncoding.EncodeToString(audio), nil
 }
 
-var kbitratePattern = regexp.MustCompile(`(\d+)kbitrate`)
-
 // Duration estimates the length of the audio from its size and bitrate.
 // MP3 is constant bitrate; formats without one (opus) assume 48 kbit/s.
 func (t *EdgeTTS) Duration() (time.Duration, error) {
@@ -333,41 +438,12 @@ func (t *EdgeTTS) Duration() (time.Duration, error) {
 	if err != nil {
 		return 0, err
 	}
-	kbps := int64(48)
-	if m := kbitratePattern.FindStringSubmatch(t.format); m != nil {
-		if v, _ := strconv.ParseInt(m[1], 10, 64); v > 0 {
-			kbps = v
-		}
-	}
-	return time.Duration(int64(len(audio)) * 8 * int64(time.Millisecond) / kbps), nil
+	return estimateDuration(len(audio), t.format), nil
 }
 
 // Extension returns the file extension of the output format, such as "mp3".
 func (t *EdgeTTS) Extension() string {
-	f := t.format
-	switch {
-	case strings.Contains(f, "mp3"):
-		return "mp3"
-	case strings.Contains(f, "opus") && strings.Contains(f, "webm"):
-		return "webm"
-	case strings.Contains(f, "opus") && strings.Contains(f, "ogg"):
-		return "ogg"
-	case strings.Contains(f, "wav") || strings.Contains(f, "riff"):
-		return "wav"
-	case strings.Contains(f, "pcm") && strings.Contains(f, "raw"):
-		return "pcm"
-	case strings.Contains(f, "alaw"):
-		return "alaw"
-	case strings.Contains(f, "mulaw"):
-		return "mulaw"
-	case strings.Contains(f, "truesilk"):
-		return "silk"
-	case strings.Contains(f, "g722"):
-		return "g722"
-	case strings.Contains(f, "amr"):
-		return "amr"
-	}
-	return "audio"
+	return extension(t.format)
 }
 
 // AudioInfo returns the size, format and estimated duration of the audio.
@@ -379,33 +455,58 @@ func (t *EdgeTTS) AudioInfo() (AudioInfo, error) {
 	return AudioInfo{Size: len(t.audio), Format: t.Extension(), EstimatedDuration: duration}, nil
 }
 
-// ToFile writes the audio to basePath plus the extension of the output
-// format, and returns the path it wrote.
-func (t *EdgeTTS) ToFile(basePath string) (string, error) {
+// ToFile writes the audio to path, adding the extension of the output
+// format unless path already ends with it, and returns the path it wrote.
+func (t *EdgeTTS) ToFile(path string) (string, error) {
 	audio, err := t.Bytes()
 	if err != nil {
 		return "", err
 	}
-	path := basePath + "." + t.Extension()
-	if err := os.WriteFile(path, audio, 0o644); err != nil {
-		return "", err
-	}
-	return path, nil
+	return writeAudio(path, t.Extension(), audio)
 }
 
 // WordBoundaries returns when each word of the last synthesis is spoken.
 func (t *EdgeTTS) WordBoundaries() []WordBoundary {
-	return t.boundaries
+	return t.words
 }
+
+// SentenceBoundaries returns when each sentence of the last synthesis is
+// spoken, with the opening punctuation of the text (¿, ¡, «...) that the
+// service leaves out.
+func (t *EdgeTTS) SentenceBoundaries() []SentenceBoundary {
+	return t.sentences
+}
+
+// SRT returns subtitles of the last synthesis, one cue per sentence.
+func (t *EdgeTTS) SRT() string { return SRT(cues(t.sentences, t.words)) }
+
+// VTT returns WebVTT subtitles of the last synthesis, one cue per sentence.
+func (t *EdgeTTS) VTT() string { return VTT(cues(t.sentences, t.words)) }
 
 // SaveMetadata writes the word boundaries to path as JSON.
 func (t *EdgeTTS) SaveMetadata(path string) error {
-	if len(t.boundaries) == 0 {
+	if len(t.words) == 0 {
 		return ErrNoMetadata
 	}
-	data, err := json.MarshalIndent(t.boundaries, "", "    ")
+	data, err := json.MarshalIndent(t.words, "", "    ")
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0o644)
+}
+
+// cues returns the sentences, or the words when there are none.
+func cues(sentences, words []Boundary) []Boundary {
+	if len(sentences) > 0 {
+		return sentences
+	}
+	return words
+}
+
+func writeAudio(path, ext string, audio []byte) (string, error) {
+	path = filePath(path, ext)
+	if err := os.WriteFile(path, audio, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }

@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
+	"time"
 )
 
 // Voice describes a voice of the service.
@@ -32,18 +34,35 @@ type VoiceTag struct {
 	VoicePersonalities []string `json:"VoicePersonalities"`
 }
 
-// Voices returns every voice of the service.
+// Voices returns every voice of the service. The list is kept for the
+// time set with WithVoicesCacheTTL, 10 minutes by default.
 func (t *EdgeTTS) Voices(ctx context.Context) ([]Voice, error) {
+	t.voicesMu.Lock()
+	defer t.voicesMu.Unlock()
+	if t.voicesCache != nil && time.Now().Before(t.voicesExpires) {
+		return slices.Clone(t.voicesCache), nil
+	}
+	voices, err := t.fetchVoices(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if t.voicesCacheTTL > 0 {
+		t.voicesCache, t.voicesExpires = voices, time.Now().Add(t.voicesCacheTTL)
+	}
+	return slices.Clone(voices), nil
+}
+
+func (t *EdgeTTS) fetchVoices(ctx context.Context) ([]Voice, error) {
 	for attempt := 0; ; attempt++ {
 		url := t.voicesURL +
 			"?TrustedClientToken=" + TrustedClientToken +
 			"&Sec-MS-GEC=" + secMSGEC(now()) +
-			"&Sec-MS-GEC-Version=" + SecMSGECVersion
+			"&Sec-MS-GEC-Version=" + t.secMSGECVersion
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, err
 		}
-		req.Header = voiceHeaders()
+		req.Header = withHeaders(voiceHeaders(), t.headers)
 
 		resp, err := t.httpClient.Do(req)
 		if err != nil {
